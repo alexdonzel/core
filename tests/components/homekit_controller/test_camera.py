@@ -10,11 +10,13 @@ from aiohomekit.testing import FAKE_CAMERA_IMAGE
 import pytest
 
 from homeassistant.components import camera
+from homeassistant.components.camera import CameraEntityFeature
+from homeassistant.const import ATTR_SUPPORTED_FEATURES
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
-from .common import setup_test_component
+from .common import TEST_IP_PAIRING_DATA, setup_test_component
 
 
 def create_camera(accessory: Accessory) -> None:
@@ -146,3 +148,71 @@ async def test_get_image_default_size_failure_is_not_retried(
         await camera.async_get_image(hass, helper.entity_id)
 
     mock_image.assert_awaited_once_with(ANY, 640, 480)
+
+
+async def test_stream_source(hass: HomeAssistant) -> None:
+    """Test an IP camera exposes its live stream as a go2rtc homekit:// source."""
+    helper = await setup_test_component(hass, 1, create_camera, connection="IP")
+
+    state = await helper.poll_and_get_state()
+    assert state.attributes[ATTR_SUPPORTED_FEATURES] == CameraEntityFeature.STREAM
+    assert await camera.async_get_stream_source(hass, helper.entity_id) == (
+        "homekit://192.168.1.50:51826/"
+        "?device_id=00:00:00:00:00:00"
+        f"&device_public={TEST_IP_PAIRING_DATA['AccessoryLTPK']}"
+        "&client_id=00000000-0000-0000-0000-000000000000"
+        f"&client_private={TEST_IP_PAIRING_DATA['iOSDeviceLTSK']}"
+        f"{TEST_IP_PAIRING_DATA['iOSDeviceLTPK']}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("address", "port", "authority"),
+    [
+        pytest.param("192.168.1.60", 51827, "192.168.1.60:51827", id="ipv4"),
+        pytest.param("fd00::60", 51827, "[fd00::60]:51827", id="ipv6"),
+    ],
+)
+async def test_stream_source_follows_address_change(
+    hass: HomeAssistant, address: str, port: int, authority: str
+) -> None:
+    """Test the stream source uses the address discovery last stored."""
+    helper = await setup_test_component(hass, 1, create_camera, connection="IP")
+
+    hass.config_entries.async_update_entry(
+        helper.config_entry,
+        data={
+            **helper.config_entry.data,
+            "AccessoryIP": address,
+            "AccessoryPort": port,
+        },
+    )
+
+    source = await camera.async_get_stream_source(hass, helper.entity_id)
+    assert source == (
+        f"homekit://{authority}/"
+        "?device_id=00:00:00:00:00:00"
+        f"&device_public={TEST_IP_PAIRING_DATA['AccessoryLTPK']}"
+        "&client_id=00000000-0000-0000-0000-000000000000"
+        f"&client_private={TEST_IP_PAIRING_DATA['iOSDeviceLTSK']}"
+        f"{TEST_IP_PAIRING_DATA['iOSDeviceLTPK']}"
+    )
+
+
+async def test_no_stream_for_bridged_camera(hass: HomeAssistant) -> None:
+    """Test a camera behind a bridge does not offer a live stream."""
+    helper = await setup_test_component(hass, 2, create_camera, connection="IP")
+
+    state = await helper.poll_and_get_state()
+    assert state.attributes[ATTR_SUPPORTED_FEATURES] == 0
+    assert await camera.async_get_stream_source(hass, helper.entity_id) is None
+
+
+@pytest.mark.usefixtures("enable_bluetooth", "fake_ble_discovery", "fake_ble_pairing")
+async def test_no_stream_for_ble_camera(hass: HomeAssistant) -> None:
+    """Test a camera not paired over IP does not offer a live stream."""
+    helper = await setup_test_component(hass, 1, create_camera, connection="BLE")
+
+    state = await helper.poll_and_get_state()
+    assert state.attributes[ATTR_SUPPORTED_FEATURES] == 0
+    assert await camera.async_get_stream_source(hass, helper.entity_id) is None
